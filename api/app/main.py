@@ -35,6 +35,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class QueueFileRequest(BaseModel):
+    path: str
+
+
+class QueueActionRequest(BaseModel):
+    files: list[QueueFileRequest]
+    elapsed_seconds: int | None = None
+
+
 def slugify(value: str) -> str:
     value = value.strip().lower()
     value = unicodedata.normalize("NFKD", value)
@@ -243,6 +252,61 @@ def build_queue_items(search: str | None = None):
     return queue_items
 
 
+def ensure_path_inside_storage(file_path: Path) -> None:
+    storage_root = STORAGE_ROOT.resolve()
+    resolved_path = file_path.resolve()
+
+    if storage_root not in resolved_path.parents:
+        raise HTTPException(
+            status_code=400,
+            detail="Arquivo fora da pasta de armazenamento do StudioFlow.",
+        )
+
+
+def move_files_to_subfolder(files: list[QueueFileRequest], folder_name: str):
+    moved_files = []
+    skipped_files = []
+
+    for file_data in files:
+        original_path = Path(file_data.path)
+
+        if not original_path.exists():
+            skipped_files.append(
+                {
+                    "path": str(original_path),
+                    "reason": "Arquivo não encontrado.",
+                }
+            )
+            continue
+
+        ensure_path_inside_storage(original_path)
+
+        destination_folder = original_path.parent / folder_name
+        destination_folder.mkdir(parents=True, exist_ok=True)
+
+        destination_path = destination_folder / original_path.name
+
+        if destination_path.exists():
+            skipped_files.append(
+                {
+                    "path": str(original_path),
+                    "reason": "Arquivo já existe no destino.",
+                }
+            )
+            continue
+
+        shutil.move(str(original_path), str(destination_path))
+
+        moved_files.append(
+            {
+                "from": str(original_path),
+                "to": str(destination_path),
+            }
+        )
+
+    return moved_files, skipped_files
+
+
 @app.get("/")
 async def root():
     return {"message": "API do StudioFlow"}
@@ -350,4 +414,38 @@ async def upload(
         "upload_mode": upload_mode,
         "target_path": str(target_path),
         "saved_files": saved_files,
+    }
+
+
+@app.post("/queue/finalize")
+async def finalize_queue_items(data: QueueActionRequest):
+    moved_files, skipped_files = move_files_to_subfolder(
+        files=data.files,
+        folder_name="finalizadas",
+    )
+
+    return {
+        "message": "Finalização concluída.",
+        "elapsed_seconds": data.elapsed_seconds,
+        "moved_files": moved_files,
+        "skipped_files": skipped_files,
+        "total_moved": len(moved_files),
+        "total_skipped": len(skipped_files),
+    }
+
+
+@app.post("/queue/cancel")
+async def cancel_queue_items(data: QueueActionRequest):
+    moved_files, skipped_files = move_files_to_subfolder(
+        files=data.files,
+        folder_name="canceladas",
+    )
+
+    return {
+        "message": "Cancelamento concluído.",
+        "elapsed_seconds": data.elapsed_seconds,
+        "moved_files": moved_files,
+        "skipped_files": skipped_files,
+        "total_moved": len(moved_files),
+        "total_skipped": len(skipped_files),
     }
