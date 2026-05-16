@@ -1,3 +1,4 @@
+import { openPath } from "@tauri-apps/plugin-opener"
 import { useEffect, useMemo, useState } from "react"
 
 type QueueFile = {
@@ -21,38 +22,38 @@ type QueueResponse = {
   items: QueueItem[]
 }
 
-type ClientSummary = {
+type QueueGroup = {
   client_name: string
-  stills_count: number
-  lookbooks_count: number
-  conceitos_count: number
-  total_count: number
+  collection_name: string
+  category: string
+  quantity: number
+  items: QueueItem[]
 }
 
-const categories = [
-  { key: "stills", label: "Stills" },
-  { key: "lookbooks", label: "Lookbooks" },
-  { key: "conceitos", label: "Conceitos" },
-]
+function getItemId(item: QueueItem) {
+  return [
+    item.client_name,
+    item.collection_name,
+    item.category,
+    item.reference_code,
+    item.file_name ?? "reference",
+  ].join("::")
+}
 
 function TreatmentQueuePage() {
   const [items, setItems] = useState<QueueItem[]>([])
-  const [search, setSearch] = useState("")
-  const [selectedClient, setSelectedClient] = useState("")
-  const [selectedCategory, setSelectedCategory] = useState("")
+  const [selectedGroup, setSelectedGroup] = useState<QueueGroup | null>(null)
+  const [detailSearch, setDetailSearch] = useState("")
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([])
   const [statusMessage, setStatusMessage] = useState("Carregando fila...")
   const [isLoading, setIsLoading] = useState(false)
 
-  async function loadQueue(searchValue = "") {
+  async function loadQueue() {
     try {
       setIsLoading(true)
       setStatusMessage("Carregando fila de tratamento...")
 
-      const query = searchValue.trim()
-        ? `?search=${encodeURIComponent(searchValue.trim())}`
-        : ""
-
-      const response = await fetch(`http://localhost:8000/queue${query}`)
+      const response = await fetch("http://localhost:8000/queue")
       const data: QueueResponse = await response.json()
 
       setItems(data.items)
@@ -69,103 +70,174 @@ function TreatmentQueuePage() {
     loadQueue()
   }, [])
 
-  const clientSummaries = useMemo(() => {
-    const summariesByClient = new Map<string, ClientSummary>()
+  const groups = useMemo(() => {
+    const groupMap = new Map<string, QueueGroup>()
 
     items.forEach((item) => {
-      const existingSummary = summariesByClient.get(item.client_name)
+      const key = `${item.client_name}-${item.collection_name}-${item.category}`
+      const existingGroup = groupMap.get(key)
 
-      const summary =
-        existingSummary ??
-        {
-          client_name: item.client_name,
-          stills_count: 0,
-          lookbooks_count: 0,
-          conceitos_count: 0,
-          total_count: 0,
-        }
-
-      if (item.category === "stills") {
-        summary.stills_count += 1
+      if (existingGroup) {
+        existingGroup.quantity += item.file_count
+        existingGroup.items.push(item)
+        return
       }
 
-      if (item.category === "lookbooks") {
-        summary.lookbooks_count += 1
-      }
-
-      if (item.category === "conceitos") {
-        summary.conceitos_count += 1
-      }
-
-      summary.total_count += 1
-      summariesByClient.set(item.client_name, summary)
+      groupMap.set(key, {
+        client_name: item.client_name,
+        collection_name: item.collection_name,
+        category: item.category,
+        quantity: item.file_count,
+        items: [item],
+      })
     })
 
-    return Array.from(summariesByClient.values()).sort((a, b) =>
-      a.client_name.localeCompare(b.client_name),
-    )
+    return Array.from(groupMap.values()).sort((a, b) => {
+      const clientCompare = a.client_name.localeCompare(b.client_name)
+
+      if (clientCompare !== 0) {
+        return clientCompare
+      }
+
+      const collectionCompare = a.collection_name.localeCompare(b.collection_name)
+
+      if (collectionCompare !== 0) {
+        return collectionCompare
+      }
+
+      return a.category.localeCompare(b.category)
+    })
   }, [items])
 
-  const selectedClientItems = useMemo(() => {
-    if (!selectedClient) {
+  const filteredGroupItems = useMemo(() => {
+    if (!selectedGroup) {
       return []
     }
 
-    return items.filter((item) => item.client_name === selectedClient)
-  }, [items, selectedClient])
+    const search = detailSearch.trim().toLowerCase()
 
-  const selectedClientCategoryCounts = useMemo(() => {
-    return categories.map((category) => {
-      const count = selectedClientItems.filter(
-        (item) => item.category === category.key,
-      ).length
+    if (!search) {
+      return selectedGroup.items
+    }
 
-      return {
-        ...category,
-        count,
-      }
+    return selectedGroup.items.filter((item) => {
+      const values = [
+        item.client_name,
+        item.collection_name,
+        item.category,
+        item.reference_code,
+        item.file_name ?? "",
+        ...item.files.map((file) => file.file_name),
+      ]
+
+      return values.some((value) => value.toLowerCase().includes(search))
     })
-  }, [selectedClientItems])
+  }, [selectedGroup, detailSearch])
 
-  const visibleItems = useMemo(() => {
-    if (!selectedClient || !selectedCategory) {
+  const visibleItemIds = useMemo(() => {
+    return filteredGroupItems.map((item) => getItemId(item))
+  }, [filteredGroupItems])
+
+  const selectedVisibleCount = useMemo(() => {
+    return visibleItemIds.filter((id) => selectedItemIds.includes(id)).length
+  }, [selectedItemIds, visibleItemIds])
+
+  const allVisibleSelected =
+    visibleItemIds.length > 0 && selectedVisibleCount === visibleItemIds.length
+
+  const selectedItems = useMemo(() => {
+    if (!selectedGroup) {
       return []
     }
 
-    return items.filter(
-      (item) =>
-        item.client_name === selectedClient &&
-        item.category === selectedCategory,
+    return selectedGroup.items.filter((item) =>
+      selectedItemIds.includes(getItemId(item)),
     )
-  }, [items, selectedClient, selectedCategory])
+  }, [selectedGroup, selectedItemIds])
 
-  function handleSearchSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    setSelectedClient("")
-    setSelectedCategory("")
-    loadQueue(search)
+  const selectedFileCount = useMemo(() => {
+    return selectedItems.reduce((total, item) => total + item.file_count, 0)
+  }, [selectedItems])
+
+  function handleSelectGroup(group: QueueGroup) {
+    setSelectedGroup(group)
+    setDetailSearch("")
+    setSelectedItemIds([])
   }
 
-  function handleClearSearch() {
-    setSearch("")
-    setSelectedClient("")
-    setSelectedCategory("")
-    loadQueue("")
+  function handleBackToGroups() {
+    setSelectedGroup(null)
+    setDetailSearch("")
+    setSelectedItemIds([])
   }
 
-  function handleSelectClient(clientName: string) {
-    setSelectedClient(clientName)
-    setSelectedCategory("")
+  function toggleItem(item: QueueItem) {
+    const itemId = getItemId(item)
+
+    setSelectedItemIds((currentIds) => {
+      if (currentIds.includes(itemId)) {
+        return currentIds.filter((id) => id !== itemId)
+      }
+
+      return [...currentIds, itemId]
+    })
   }
 
-  function handleBackToClients() {
-    setSelectedClient("")
-    setSelectedCategory("")
+  function toggleSelectAllVisible() {
+    if (allVisibleSelected) {
+      setSelectedItemIds((currentIds) =>
+        currentIds.filter((id) => !visibleItemIds.includes(id)),
+      )
+
+      return
+    }
+
+    setSelectedItemIds((currentIds) => {
+      const nextIds = [...currentIds]
+
+      visibleItemIds.forEach((id) => {
+        if (!nextIds.includes(id)) {
+          nextIds.push(id)
+        }
+      })
+
+      return nextIds
+    })
   }
 
-  function handleBackToCategories() {
-    setSelectedCategory("")
+async function handlePreparedAction(actionName: string) {
+  if (selectedItems.length === 0) {
+    setStatusMessage("Selecione ao menos um item.")
+    return
   }
+
+  if (actionName === "Abrir") {
+    const filesToOpen = selectedItems.flatMap((item) => item.files)
+
+    setStatusMessage(
+      `Abrindo ${filesToOpen.length} arquivo(s) no aplicativo padrão...`,
+    )
+
+    try {
+      for (const file of filesToOpen) {
+        await openPath(file.path)
+      }
+
+      setStatusMessage(`${filesToOpen.length} arquivo(s) aberto(s).`)
+    } catch (error) {
+  console.error("Erro ao abrir arquivo:", error)
+  setStatusMessage(`Erro ao abrir arquivo: ${String(error)}`)
+}
+
+    return
+  }
+
+  setStatusMessage(
+    `${actionName}: ${selectedItems.length} item(ns), ${selectedFileCount} arquivo(s) selecionado(s).`,
+  )
+
+  console.log(`${actionName} - itens selecionados:`, selectedItems)
+}
 
   return (
     <main
@@ -194,67 +266,12 @@ function TreatmentQueuePage() {
           color: "#4b5563",
         }}
       >
-        Escolha um cliente, depois uma categoria, e então selecione os itens para trabalhar.
+        Organizada por cliente, coleção e tipo de arquivo.
       </p>
-
-      <form
-        onSubmit={handleSearchSubmit}
-        style={{
-          display: "flex",
-          gap: "12px",
-          marginBottom: "20px",
-          maxWidth: "920px",
-        }}
-      >
-        <input
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Pesquisar por cliente, coleção, referência ou trecho do arquivo. Ex: -C1"
-          style={{
-            flex: 1,
-            padding: "12px",
-            borderRadius: "10px",
-            border: "1px solid #d1d5db",
-          }}
-        />
-
-        <button
-          type="submit"
-          disabled={isLoading}
-          style={{
-            padding: "12px 16px",
-            border: "none",
-            borderRadius: "10px",
-            backgroundColor: "#2563eb",
-            color: "#ffffff",
-            fontWeight: 700,
-            cursor: "pointer",
-          }}
-        >
-          Pesquisar
-        </button>
-
-        <button
-          type="button"
-          onClick={handleClearSearch}
-          disabled={isLoading}
-          style={{
-            padding: "12px 16px",
-            border: "none",
-            borderRadius: "10px",
-            backgroundColor: "#111827",
-            color: "#ffffff",
-            fontWeight: 700,
-            cursor: "pointer",
-          }}
-        >
-          Limpar
-        </button>
-      </form>
 
       <div
         style={{
-          maxWidth: "920px",
+          maxWidth: "980px",
           marginBottom: "16px",
           padding: "12px",
           borderRadius: "10px",
@@ -266,70 +283,58 @@ function TreatmentQueuePage() {
         {statusMessage}
       </div>
 
-      {!selectedClient && (
+      {!selectedGroup && (
         <section
           style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-            gap: "16px",
+            maxWidth: "980px",
+            backgroundColor: "#ffffff",
+            borderRadius: "16px",
+            boxShadow: "0 8px 24px rgba(0, 0, 0, 0.06)",
+            overflow: "hidden",
+            border: "1px solid #e5e7eb",
           }}
         >
-          {clientSummaries.map((client) => (
-            <button
-              key={client.client_name}
-              type="button"
-              onClick={() => handleSelectClient(client.client_name)}
-              style={{
-                textAlign: "left",
-                padding: "20px",
-                backgroundColor: "#ffffff",
-                borderRadius: "16px",
-                boxShadow: "0 8px 24px rgba(0, 0, 0, 0.06)",
-                border: "1px solid #e5e7eb",
-                cursor: "pointer",
-              }}
-            >
-              <h2
-                style={{
-                  marginTop: 0,
-                  marginBottom: "12px",
-                  color: "#111827",
-                }}
-              >
-                {client.client_name}
-              </h2>
+          <table
+            style={{
+              width: "100%",
+              borderCollapse: "collapse",
+            }}
+          >
+            <thead>
+              <tr style={{ backgroundColor: "#f3f4f6" }}>
+                <th style={tableHeaderStyle}>Cliente</th>
+                <th style={tableHeaderStyle}>Coleção</th>
+                <th style={tableHeaderStyle}>Arquivo</th>
+                <th style={tableHeaderStyle}>Quantidade</th>
+              </tr>
+            </thead>
 
-              <p style={{ margin: "6px 0", color: "#374151" }}>
-                <strong>{client.stills_count}</strong> stills
-              </p>
-
-              <p style={{ margin: "6px 0", color: "#374151" }}>
-                <strong>{client.lookbooks_count}</strong> lookbooks
-              </p>
-
-              <p style={{ margin: "6px 0", color: "#374151" }}>
-                <strong>{client.conceitos_count}</strong> conceitos
-              </p>
-
-              <p
-                style={{
-                  margin: "12px 0 0",
-                  color: "#6d28d9",
-                  fontWeight: 700,
-                }}
-              >
-                Total: {client.total_count} item(ns)
-              </p>
-            </button>
-          ))}
+            <tbody>
+              {groups.map((group) => (
+                <tr
+                  key={`${group.client_name}-${group.collection_name}-${group.category}`}
+                  onClick={() => handleSelectGroup(group)}
+                  style={{
+                    cursor: "pointer",
+                    borderTop: "1px solid #e5e7eb",
+                  }}
+                >
+                  <td style={tableCellStyle}>{group.client_name}</td>
+                  <td style={tableCellStyle}>{group.collection_name}</td>
+                  <td style={tableCellStyle}>{group.category}</td>
+                  <td style={tableCellStyle}>{group.quantity}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </section>
       )}
 
-      {selectedClient && !selectedCategory && (
+      {selectedGroup && (
         <section>
           <button
             type="button"
-            onClick={handleBackToClients}
+            onClick={handleBackToGroups}
             style={{
               marginBottom: "16px",
               padding: "10px 14px",
@@ -341,96 +346,110 @@ function TreatmentQueuePage() {
               cursor: "pointer",
             }}
           >
-            Voltar para clientes
+            Voltar para resumo
           </button>
 
           <h2
             style={{
               marginTop: 0,
-              marginBottom: "16px",
+              marginBottom: "8px",
               color: "#111827",
             }}
           >
-            {selectedClient}
+            {selectedGroup.client_name} / {selectedGroup.collection_name} /{" "}
+            {selectedGroup.category}
           </h2>
+
+          <p
+            style={{
+              marginTop: 0,
+              marginBottom: "16px",
+              color: "#4b5563",
+            }}
+          >
+            {selectedGroup.quantity} arquivo(s) no grupo.
+          </p>
+
+          <input
+            value={detailSearch}
+            onChange={(event) => setDetailSearch(event.target.value)}
+            placeholder="Pesquisar dentro deste grupo. Ex: -C1, 168LB, Y4381D"
+            style={{
+              width: "100%",
+              maxWidth: "760px",
+              padding: "12px",
+              borderRadius: "10px",
+              border: "1px solid #d1d5db",
+              marginBottom: "16px",
+            }}
+          />
 
           <div
             style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-              gap: "16px",
+              maxWidth: "980px",
+              marginBottom: "16px",
+              padding: "16px",
+              borderRadius: "16px",
+              backgroundColor: "#ffffff",
+              border: "1px solid #e5e7eb",
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: "12px",
             }}
           >
-            {selectedClientCategoryCounts.map((category) => (
-              <button
-                key={category.key}
-                type="button"
-                onClick={() => setSelectedCategory(category.key)}
-                disabled={category.count === 0}
-                style={{
-                  textAlign: "left",
-                  padding: "20px",
-                  backgroundColor: "#ffffff",
-                  borderRadius: "16px",
-                  boxShadow: "0 8px 24px rgba(0, 0, 0, 0.06)",
-                  border: "1px solid #e5e7eb",
-                  cursor: category.count === 0 ? "not-allowed" : "pointer",
-                  opacity: category.count === 0 ? 0.55 : 1,
-                }}
-              >
-                <h3
-                  style={{
-                    marginTop: 0,
-                    marginBottom: "8px",
-                    color: "#111827",
-                  }}
-                >
-                  {category.label}
-                </h3>
+            <button
+              type="button"
+              onClick={toggleSelectAllVisible}
+              disabled={visibleItemIds.length === 0}
+              style={{
+                padding: "10px 14px",
+                border: "none",
+                borderRadius: "10px",
+                backgroundColor: "#374151",
+                color: "#ffffff",
+                fontWeight: 700,
+                cursor: visibleItemIds.length === 0 ? "not-allowed" : "pointer",
+              }}
+            >
+              {allVisibleSelected ? "Desmarcar visíveis" : "Selecionar visíveis"}
+            </button>
 
-                <p
-                  style={{
-                    margin: 0,
-                    color: "#6d28d9",
-                    fontWeight: 700,
-                  }}
-                >
-                  {category.count} item(ns)
-                </p>
-              </button>
-            ))}
+            <button
+              type="button"
+              onClick={() => handlePreparedAction("Abrir")}
+              style={actionButtonStyle}
+            >
+              Abrir
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handlePreparedAction("Finalizar")}
+              style={actionButtonStyle}
+            >
+              Finalizar
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handlePreparedAction("Cancelar")}
+              style={dangerButtonStyle}
+            >
+              Cancelar
+            </button>
+
+            <span
+              style={{
+                marginLeft: "auto",
+                color: "#374151",
+                fontWeight: 700,
+              }}
+            >
+              {selectedItems.length} item(ns) / {selectedFileCount} arquivo(s)
+              selecionado(s)
+            </span>
           </div>
-        </section>
-      )}
-
-      {selectedClient && selectedCategory && (
-        <section>
-          <button
-            type="button"
-            onClick={handleBackToCategories}
-            style={{
-              marginBottom: "16px",
-              padding: "10px 14px",
-              border: "none",
-              borderRadius: "10px",
-              backgroundColor: "#111827",
-              color: "#ffffff",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            Voltar para categorias
-          </button>
-
-          <h2
-            style={{
-              marginTop: 0,
-              marginBottom: "16px",
-              color: "#111827",
-            }}
-          >
-            {selectedClient} / {selectedCategory}
-          </h2>
 
           <section
             style={{
@@ -439,84 +458,120 @@ function TreatmentQueuePage() {
               gap: "16px",
             }}
           >
-            {visibleItems.map((item) => (
-              <article
-                key={`${item.client_name}-${item.collection_name}-${item.category}-${item.reference_code}-${item.file_name ?? "reference"}`}
-                style={{
-                  padding: "20px",
-                  backgroundColor: "#ffffff",
-                  borderRadius: "16px",
-                  boxShadow: "0 8px 24px rgba(0, 0, 0, 0.06)",
-                  border: "1px solid #e5e7eb",
-                }}
-              >
-                <div
+            {filteredGroupItems.map((item) => {
+              const itemId = getItemId(item)
+              const isSelected = selectedItemIds.includes(itemId)
+
+              return (
+                <article
+                  key={itemId}
+                  onClick={() => toggleItem(item)}
                   style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: "12px",
-                    marginBottom: "12px",
+                    padding: "20px",
+                    backgroundColor: isSelected ? "#ede9fe" : "#ffffff",
+                    borderRadius: "16px",
+                    boxShadow: "0 8px 24px rgba(0, 0, 0, 0.06)",
+                    border: isSelected
+                      ? "2px solid #6d28d9"
+                      : "1px solid #e5e7eb",
+                    cursor: "pointer",
                   }}
                 >
-                  <strong
+                  <div
                     style={{
-                      fontSize: "18px",
-                      color: "#111827",
+                      display: "flex",
+                      gap: "12px",
+                      alignItems: "flex-start",
+                      marginBottom: "8px",
                     }}
                   >
-                    {item.item_type === "reference"
-                      ? `Referência ${item.reference_code}`
-                      : item.file_name}
-                  </strong>
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => toggleItem(item)}
+                      onClick={(event) => event.stopPropagation()}
+                      style={{
+                        width: "18px",
+                        height: "18px",
+                        marginTop: "3px",
+                      }}
+                    />
 
-                  <span
-                    style={{
-                      padding: "4px 8px",
-                      borderRadius: "999px",
-                      backgroundColor:
-                        item.category === "stills" ? "#dcfce7" : "#dbeafe",
-                      color: item.category === "stills" ? "#166534" : "#1e40af",
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {item.category}
-                  </span>
-                </div>
+                    <strong
+                      style={{
+                        display: "block",
+                        fontSize: "18px",
+                        color: "#111827",
+                      }}
+                    >
+                      {item.item_type === "reference"
+                        ? `${item.reference_code} - ${item.file_count} arquivo(s)`
+                        : item.file_name}
+                    </strong>
+                  </div>
 
-                <p style={{ margin: "4px 0", color: "#374151" }}>
-                  <strong>Coleção:</strong> {item.collection_name}
-                </p>
+                  <p style={{ margin: "4px 0", color: "#374151" }}>
+                    <strong>Referência:</strong> {item.reference_code}
+                  </p>
 
-                <p style={{ margin: "4px 0", color: "#374151" }}>
-                  <strong>Referência:</strong> {item.reference_code}
-                </p>
+                  <p style={{ margin: "4px 0 12px", color: "#374151" }}>
+                    <strong>Arquivos:</strong> {item.file_count}
+                  </p>
 
-                <p style={{ margin: "4px 0 12px", color: "#374151" }}>
-                  <strong>Arquivos:</strong> {item.file_count}
-                </p>
+                  <details onClick={(event) => event.stopPropagation()}>
+                    <summary style={{ cursor: "pointer", fontWeight: 700 }}>
+                      Ver arquivos
+                    </summary>
 
-                <details>
-                  <summary style={{ cursor: "pointer", fontWeight: 700 }}>
-                    Ver arquivos
-                  </summary>
-
-                  <ul style={{ paddingLeft: "20px" }}>
-                    {item.files.map((file) => (
-                      <li key={file.path} style={{ marginTop: "6px" }}>
-                        {file.file_name}
-                      </li>
-                    ))}
-                  </ul>
-                </details>
-              </article>
-            ))}
+                    <ul style={{ paddingLeft: "20px" }}>
+                      {item.files.map((file) => (
+                        <li key={file.path} style={{ marginTop: "6px" }}>
+                          {file.file_name}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                </article>
+              )
+            })}
           </section>
         </section>
       )}
     </main>
   )
+}
+
+const tableHeaderStyle = {
+  padding: "12px",
+  textAlign: "left" as const,
+  color: "#111827",
+  fontSize: "14px",
+  borderBottom: "1px solid #e5e7eb",
+}
+
+const tableCellStyle = {
+  padding: "12px",
+  color: "#374151",
+}
+
+const actionButtonStyle = {
+  padding: "10px 14px",
+  border: "none",
+  borderRadius: "10px",
+  backgroundColor: "#2563eb",
+  color: "#ffffff",
+  fontWeight: 700,
+  cursor: "pointer",
+}
+
+const dangerButtonStyle = {
+  padding: "10px 14px",
+  border: "none",
+  borderRadius: "10px",
+  backgroundColor: "#dc2626",
+  color: "#ffffff",
+  fontWeight: 700,
+  cursor: "pointer",
 }
 
 export default TreatmentQueuePage
