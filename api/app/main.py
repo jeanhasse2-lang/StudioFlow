@@ -3,7 +3,7 @@ import re
 import shutil
 import unicodedata
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -27,6 +27,7 @@ app.add_middleware(
 
 STORAGE_ROOT = Path("C:/StudioFlowStorage")
 OPERATIONAL_CATEGORIES = ["lookbooks", "stills", "conceitos"]
+NON_WORKING_FOLDERS = ["finalizadas", "canceladas"]
 
 
 class LoginRequest(BaseModel):
@@ -121,6 +122,127 @@ def list_storage_options():
     return clients
 
 
+def get_file_reference_code(file_name: str) -> str:
+    stem = Path(file_name).stem
+    return stem.split("-")[0]
+
+
+def is_working_file(file_path: Path) -> bool:
+    if not file_path.is_file():
+        return False
+
+    lower_parts = [part.lower() for part in file_path.parts]
+
+    for folder in NON_WORKING_FOLDERS:
+        if folder in lower_parts:
+            return False
+
+    return True
+
+
+def item_matches_search(item: dict, search: str | None) -> bool:
+    if not search:
+        return True
+
+    search_lower = search.lower()
+
+    searchable_values = [
+        str(item.get("client_name", "")),
+        str(item.get("collection_name", "")),
+        str(item.get("category", "")),
+        str(item.get("reference_code", "")),
+        str(item.get("file_name", "")),
+    ]
+
+    for file in item.get("files", []):
+        searchable_values.append(str(file.get("file_name", "")))
+        searchable_values.append(str(file.get("path", "")))
+
+    return any(search_lower in value.lower() for value in searchable_values)
+
+
+def build_queue_items(search: str | None = None):
+    queue_items = []
+
+    if not STORAGE_ROOT.exists():
+        return queue_items
+
+    for client_path in STORAGE_ROOT.iterdir():
+        if not client_path.is_dir():
+            continue
+
+        for collection_path in client_path.iterdir():
+            if not collection_path.is_dir():
+                continue
+
+            for category in OPERATIONAL_CATEGORIES:
+                category_path = collection_path / category
+
+                if not category_path.exists():
+                    continue
+
+                working_files = [
+                    file_path
+                    for file_path in category_path.iterdir()
+                    if is_working_file(file_path)
+                ]
+
+                if category == "stills":
+                    grouped_by_reference: dict[str, list[Path]] = {}
+
+                    for file_path in working_files:
+                        reference_code = get_file_reference_code(file_path.name)
+
+                        if reference_code not in grouped_by_reference:
+                            grouped_by_reference[reference_code] = []
+
+                        grouped_by_reference[reference_code].append(file_path)
+
+                    for reference_code, files in grouped_by_reference.items():
+                        item = {
+                            "item_type": "reference",
+                            "client_name": client_path.name,
+                            "collection_name": collection_path.name,
+                            "category": category,
+                            "reference_code": reference_code,
+                            "file_name": None,
+                            "file_count": len(files),
+                            "files": [
+                                {
+                                    "file_name": file.name,
+                                    "path": str(file),
+                                }
+                                for file in files
+                            ],
+                        }
+
+                        if item_matches_search(item, search):
+                            queue_items.append(item)
+
+                else:
+                    for file_path in working_files:
+                        item = {
+                            "item_type": "file",
+                            "client_name": client_path.name,
+                            "collection_name": collection_path.name,
+                            "category": category,
+                            "reference_code": get_file_reference_code(file_path.name),
+                            "file_name": file_path.name,
+                            "file_count": 1,
+                            "files": [
+                                {
+                                    "file_name": file_path.name,
+                                    "path": str(file_path),
+                                }
+                            ],
+                        }
+
+                        if item_matches_search(item, search):
+                            queue_items.append(item)
+
+    return queue_items
+
+
 @app.get("/")
 async def root():
     return {"message": "API do StudioFlow"}
@@ -136,6 +258,16 @@ async def storage_options():
     return {
         "storage_root": str(STORAGE_ROOT),
         "clients": list_storage_options(),
+    }
+
+
+@app.get("/queue")
+async def queue(search: str | None = Query(default=None)):
+    items = build_queue_items(search=search)
+
+    return {
+        "total": len(items),
+        "items": items,
     }
 
 
