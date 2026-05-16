@@ -87,6 +87,40 @@ def get_upload_target_path(
     return category_path
 
 
+def list_storage_options():
+    if not STORAGE_ROOT.exists():
+        return []
+
+    clients = []
+
+    for client_path in STORAGE_ROOT.iterdir():
+        if not client_path.is_dir():
+            continue
+
+        collections = []
+
+        for collection_path in client_path.iterdir():
+            if not collection_path.is_dir():
+                continue
+
+            collections.append(
+                {
+                    "name": collection_path.name,
+                    "path": str(collection_path),
+                }
+            )
+
+        clients.append(
+            {
+                "name": client_path.name,
+                "path": str(client_path),
+                "collections": collections,
+            }
+        )
+
+    return clients
+
+
 @app.get("/")
 async def root():
     return {"message": "API do StudioFlow"}
@@ -95,6 +129,14 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/storage/options")
+async def storage_options():
+    return {
+        "storage_root": str(STORAGE_ROOT),
+        "clients": list_storage_options(),
+    }
 
 
 @app.post("/login")
